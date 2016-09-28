@@ -196,7 +196,8 @@ def host(num_processes, in_dir_path, out_dir_path,
     for i in range(num_processes):
         args = (request_queue, result_queue, out_dir_path, worker_sleep_sec)
         kwargs = {'is_process': True,
-                  'log_queue': log_queue}
+                  'log_queue': log_queue,
+                  'logger': __name__}
         p = Process(target=worker_task, args=args, kwargs=kwargs)
         workers.append(p)
         logger.debug('Starting a new worker {}'.format(p.name))
