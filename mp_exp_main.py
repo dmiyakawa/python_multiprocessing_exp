@@ -88,7 +88,11 @@ def worker_task(request_queue, result_queue,
             else:
                 logger = _null_logger
         else:
-            logger = logger or _null_logger
+            if logger:
+                if type(logger) is str:
+                    logger = getLogger(logger)
+            else:
+                logger = _null_logger
         logger.debug('A new worker started (pid: {}, is_process: {})'
                      .format(os.getpid(), is_process))
         for out_file_rel_path in iter(request_queue.get, None):
@@ -109,6 +113,15 @@ def worker_task(request_queue, result_queue,
 
 def receiver_task(out_dir_path, result_queue, conn,
                   *, is_process=True, log_queue=None, logger=None):
+    '''\
+    result_queueから絶対パスを受取り、resultsリストを構築する。
+    最終的にresultsリストをconn.send()で呼び出し元に送信する。
+
+    Note: Windows環境ではloggerはシリアライズ出来ない(Pickleしようとすると
+    失敗する)そのため、logger=loggerという指定も出来ない。
+    回避策として、logger引数には文字列を受け取れるようにする。
+    文字列の場合、その文字列を用いてlogger = getLogger(logger)を実行する
+    '''
     try:
         if is_process:
             if log_queue:
@@ -116,7 +129,11 @@ def receiver_task(out_dir_path, result_queue, conn,
             else:
                 logger = _null_logger
         else:
-            logger = logger or _null_logger
+            if logger:
+                if type(logger) is str:
+                    logger = getLogger(logger)
+            else:
+                logger = _null_logger
         logger.debug('A new receiver started (pid: {}, is_process: {})'
                      .format(os.getpid(), is_process))
         results = []
@@ -163,7 +180,7 @@ def host(num_processes, in_dir_path, out_dir_path,
     receiver_args = (out_dir_path, result_queue, child_conn)
     receiver_kwargs = {'is_process': receiver_is_process,
                        'log_queue': log_queue,
-                       'logger': logger}
+                       'logger': __name__}
     if receiver_is_process:
         logger.debug('Using Process for receiver')
         receiver = Process(target=receiver_task,
@@ -179,8 +196,7 @@ def host(num_processes, in_dir_path, out_dir_path,
     for i in range(num_processes):
         args = (request_queue, result_queue, out_dir_path, worker_sleep_sec)
         kwargs = {'is_process': True,
-                  'log_queue': log_queue,
-                  'logger': logger}
+                  'log_queue': log_queue}
         p = Process(target=worker_task, args=args, kwargs=kwargs)
         workers.append(p)
         logger.debug('Starting a new worker {}'.format(p.name))
