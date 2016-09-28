@@ -23,6 +23,7 @@ from multiprocessing import Pipe, Process, Queue, freeze_support
 
 import itertools
 import os
+from queue import Empty
 import random
 import string
 from threading import Thread
@@ -108,7 +109,7 @@ def worker_task(request_queue, result_queue,
             result_queue.put(out_abs_path)
         logger.debug('Worker exitting (pid: {})'.format(os.getpid()))
     except KeyboardInterrupt:
-        pass
+        logger.debug('Worker aborting (pid: {})'.format(os.getpid()))
 
 
 def receiver_task(out_dir_path, result_queue, conn,
@@ -142,10 +143,11 @@ def receiver_task(out_dir_path, result_queue, conn,
             logger.debug('Obtained "{}" from result_queue'
                          .format(out_rel_path))
             results.append(out_rel_path)
+        logger.debug('Sending results (len: {})'.format(len(results)))
         conn.send(results)
         logger.debug('Receiver exitting (pid: {})'.format(os.getpid()))
     except KeyboardInterrupt:
-        pass
+        logger.debug('Receiver aborting (pid: {})'.format(os.getpid()))
 
 
 def host(num_processes, in_dir_path, out_dir_path,
@@ -171,7 +173,6 @@ def host(num_processes, in_dir_path, out_dir_path,
     logger.debug('Creating "{}"'.format(out_dir_path))
     os.mkdir(out_dir_path)
 
-    workers = []
     request_queue = Queue()
     result_queue = Queue()
 
@@ -181,66 +182,98 @@ def host(num_processes, in_dir_path, out_dir_path,
     receiver_kwargs = {'is_process': receiver_is_process,
                        'log_queue': log_queue,
                        'logger': __name__}
-    if receiver_is_process:
-        logger.debug('Using Process for receiver')
-        receiver = Process(target=receiver_task,
-                           args=receiver_args,
-                           kwargs=receiver_kwargs)
-    else:
-        logger.debug('Using Thread for receiver')
-        receiver = Thread(target=receiver_task,
-                          args=receiver_args,
-                          kwargs=receiver_kwargs)
-    receiver.start()
+    receiver = None
+    workers = []
+    try:
+        if receiver_is_process:
+            logger.debug('Using Process for receiver')
+            receiver = Process(target=receiver_task,
+                               args=receiver_args,
+                               kwargs=receiver_kwargs)
+        else:
+            logger.debug('Using Thread for receiver')
+            receiver = Thread(target=receiver_task,
+                              args=receiver_args,
+                              kwargs=receiver_kwargs)
+        receiver.start()
 
-    for i in range(num_processes):
-        args = (request_queue, result_queue, out_dir_path, worker_sleep_sec)
-        kwargs = {'is_process': True,
-                  'log_queue': log_queue,
-                  'logger': __name__}
-        p = Process(target=worker_task, args=args, kwargs=kwargs)
-        workers.append(p)
-        logger.debug('Starting a new worker {}'.format(p.name))
-        p.start()
+        for i in range(num_processes):
+            args = (request_queue, result_queue, out_dir_path,
+                    worker_sleep_sec)
+            kwargs = {'is_process': True,
+                      'log_queue': log_queue,
+                      'logger': __name__}
+            p = Process(target=worker_task, args=args, kwargs=kwargs)
+            workers.append(p)
+            logger.debug('Starting a new worker {}'.format(p.name))
+            p.start()
 
-    # result_queueにputされるはずのファイル数
-    num_files = 0
-    for (dirpath, dirnames, filenames) in os.walk(in_dir_path):
-        # ディレクトリはhost側で作成してしまう
-        # Workerで作れないこともないが、マルチプロセスで順序が
-        # 逆転すると、ディレクトリを作成するプロセスの前に
-        # そのディレクトリにファイルを作成するプロセスが実行される
-        # 懸念があり、ディレクトリを作成するプロセスの意義が微妙。
-        for dirname in dirnames:
-            dir_to_create = os.path.join(
-                out_dir_path,
-                os.path.relpath(
-                    os.path.join(dirpath, dirname),
-                    in_dir_path))
-            os.mkdir(dir_to_create)
-        for filename in filenames:
-            file_path = os.path.join(dirpath, filename)
-            rel_path = os.path.relpath(file_path, in_dir_path)
-            logger.debug('Pushing "{}" to request_queue'
-                         .format(rel_path))
-            request_queue.put(rel_path)
-            num_files += 1
+        # result_queueにputされるはずのファイル数
+        num_files = 0
+        for (dirpath, dirnames, filenames) in os.walk(in_dir_path):
+            # ディレクトリはhost側で作成してしまう
+            # Workerで作れないこともないが、マルチプロセスで順序が
+            # 逆転すると、ディレクトリを作成するプロセスの前に
+            # そのディレクトリにファイルを作成するプロセスが実行される
+            # 懸念があり、ディレクトリを作成するプロセスの意義が微妙。
+            for dirname in dirnames:
+                dir_to_create = os.path.join(
+                    out_dir_path,
+                    os.path.relpath(
+                        os.path.join(dirpath, dirname),
+                        in_dir_path))
+                os.mkdir(dir_to_create)
+            for filename in filenames:
+                file_path = os.path.join(dirpath, filename)
+                rel_path = os.path.relpath(file_path, in_dir_path)
+                logger.debug('Pushing "{}" to request_queue'
+                             .format(rel_path))
+                request_queue.put(rel_path)
+                num_files += 1
 
-    # sentinelを送信してWorkerに終了するよう指示する
-    for p in workers:
-        request_queue.put(None)
+        # sentinelを送信してWorkerに終了するよう指示する
+        for p in workers:
+            request_queue.put(None)
 
-    # Workerプロセスの終了を待つ
-    for p in workers:
-        logger.debug('Joining Process "{}"'.format(p.name))
-        p.join()
-    logger.debug('All worker processes ended.')
+        # Workerプロセスの終了を待つ
+        for p in workers:
+            logger.debug('Joining Process "{}"'.format(p.name))
+            p.join()
+        logger.debug('All worker processes ended.')
 
-    # Workerプロセスが終了した時点でresult_queueにsentinelを送る
-    # これによりReceiverプロセスに終了するよう指示する
-    result_queue.put(None)
-    results = parent_conn.recv()
-    receiver.join()
+        # Workerプロセスが終了した時点でresult_queueにsentinelを送る
+        # これによりReceiverプロセスに終了するよう指示する
+        result_queue.put(None)
+        results = parent_conn.recv()
+        receiver.join()
+    except KeyboardInterrupt:
+        logger.info('Keyboard Interrupt occured during work.'
+                    ' Aborting children first.')
+        # sentinelを送る
+        for p in workers:
+            request_queue.put(None)
+        result_queue.put(None)
+        log_queue.put(None)
+        for p in workers:
+            p.join()
+        logger.debug('Retrieving data from queues')
+        while not request_queue.empty():
+            try:
+                request_queue.get_nowait()
+            except Empty:
+                break
+        while not result_queue.empty():
+            try:
+                result_queue.get_nowait()
+            except Empty:
+                break
+        if parent_conn.poll():
+            logger.debug('Pipe contains data. Retrieving it')
+            parent_conn.recv()
+        receiver.join()
+        logger.info('Children aborted.')
+        raise
+
     if len(results) == num_files:
         logger.info('Total num of files processed: {}'.format(num_files))
     else:
