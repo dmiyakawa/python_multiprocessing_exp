@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 
 '''\
-Workerプロセスを経由してファイルを生成するデモ
+in_dir_pathをos.walk()で巡回し、同じ構成のツリー構造をout_dir_pathへ作る。
 
-in_dir_pathをos.walk()で巡回し、同じ構成のツリー構造を
-out_dir_pathへ作る。in_dir_pathからみた相対パスと
+in_dir_pathからみた相対パスと
 out_dir_pathから見た相対パスは完全一致する。
 in_dir_pathの巡回はホストで行い、out_dir_pathに対する
 操作を指定されたワーカで分担する。
@@ -287,7 +286,13 @@ def host(num_processes, in_dir_path, out_dir_path,
 def check(in_dir_path, out_dir_path, results,
           *, logger=None):
     '''
-    in_dir_path, out_dir_path, resultsが完全一致していることを確認する
+    in_dir_path, out_dir_path, resultsが完全一致していることを確認する。
+    成功時にTrue、そうでなければFalseを返す。
+    本プログラムの挙動にバグがない限りはTrueが返るはずである。
+
+    なお、in_dir_path内の空ディレクトリは「完全一致」の対象から外れる。
+    あくまでディレクトリ以外の一般のファイルについて
+    ディレクトリツリーが一致していることを確認するのみ。
     '''
     logger = logger or _null_logger
     in_dir_path_lst = []
