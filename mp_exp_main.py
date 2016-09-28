@@ -15,7 +15,7 @@ in_dir_pathの巡回はホストで行い、out_dir_pathに対する
 
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import getLogger, StreamHandler, Formatter
-from logging import DEBUG
+from logging import DEBUG, WARN
 from logging import NullHandler
 from logging.handlers import QueueHandler
 
@@ -33,10 +33,26 @@ _null_logger = getLogger(__name__)
 _null_logger.addHandler(NullHandler())
 
 
+class CustomError(Exception):
+    pass
+
+
+def _human_readable_time(elapsed_sec):
+    elapsed_int = int(elapsed_sec)
+    days = elapsed_int // 86400
+    hours = (elapsed_int // 3600) % 24
+    minutes = (elapsed_int // 60) % 60
+    seconds = elapsed_int % 60
+    if days > 0:
+        return '{} days {:02d}:{:02d}:{:02d}'.format(days, hours,
+                                                     minutes, seconds)
+    return '{:02d}:{:02d}:{:02d}'.format(hours, minutes, seconds)
+
+
 def _prepare_queue_logger(log_queue):
     # DEBUGレベルのルートロガーに対してQueueHandlerを指定し
     # 全てlog_queueに流し込む。
-    # メインとなるプロセス側のlogger_threadが
+    # メインとなるプロセス側のlogger_taskが
     # ログを集約してくれる
     queue_logger = getLogger()
     queue_handler = QueueHandler(log_queue)
@@ -46,35 +62,63 @@ def _prepare_queue_logger(log_queue):
     return queue_logger
 
 
-def worker_process(input_queue, output_queue,
-                   log_queue, out_dir_path, sleep_sec):
+def logger_task(log_queue):
+    '''\
+    複数プロセスから送られてくるLogRecordを集約するタスク本体。
+    Threadでの実行を前提とする。
+    log_queueからNoneを受け取ると終了する
+    '''
+    for record in iter(log_queue.get, None):
+        logger = getLogger(__name__)
+        logger.handle(record)
+
+
+def worker_task(request_queue, result_queue,
+                out_dir_path, sleep_sec,
+                *, is_process=True, log_queue=None, logger=None):
+    '''\
+    request_queueから作成するべきファイルの相対パスを受取り
+    out_dir_path下に同一相対パスの1KBのランダムなファイルを作成し、
+    作成したファイルの絶対パスをresult_queueへ送る。
+    '''
     try:
-        logger = _prepare_queue_logger(log_queue)
-        logger.debug('Start running worker_process (pid: {})'
-                     .format(os.getpid()))
-        for out_file_rel_path in iter(input_queue.get, 'STOP'):
+        if is_process:
+            if log_queue:
+                logger = _prepare_queue_logger(log_queue)
+            else:
+                logger = _null_logger
+        else:
+            logger = logger or _null_logger
+        logger.debug('A new worker started (pid: {}, is_process: {})'
+                     .format(os.getpid(), is_process))
+        for out_file_rel_path in iter(request_queue.get, None):
             if sleep_sec:
                 time.sleep(sleep_sec)
-            out_path = os.path.join(out_dir_path, out_file_rel_path)
+            out_abs_path = os.path.join(out_dir_path, out_file_rel_path)
             # ディレクトリは出来ているはずだが念のため
-            os.makedirs(os.path.basename(out_path),
-                        exist_ok=True)
-            f = open(out_path, 'w')
+            os.makedirs(os.path.basename(out_abs_path), exist_ok=True)
+            f = open(out_abs_path, 'w')
             f.write(''.join(random.choice(string.ascii_letters)
                             for l in range(1024)))
             f.close()
-            output_queue.put(out_path)
-        logger.debug('Finish running worker_process (pid: {})'
-                     .format(os.getpid()))
+            result_queue.put(out_abs_path)
+        logger.debug('Worker exitting (pid: {})'.format(os.getpid()))
     except KeyboardInterrupt:
         pass
 
 
-def receiver_process(out_dir_path, result_queue, log_queue, conn):
+def receiver_task(out_dir_path, result_queue, conn,
+                  *, is_process=True, log_queue=None, logger=None):
     try:
-        logger = _prepare_queue_logger(log_queue)
-        logger.debug('Start running receiver_process (pid: {})'
-                     .format(os.getpid()))
+        if is_process:
+            if log_queue:
+                logger = _prepare_queue_logger(log_queue)
+            else:
+                logger = _null_logger
+        else:
+            logger = logger or _null_logger
+        logger.debug('A new receiver started (pid: {}, is_process: {})'
+                     .format(os.getpid(), is_process))
         results = []
         for out_abs_path in iter(result_queue.get, None):
             out_rel_path = os.path.relpath(out_abs_path, out_dir_path)
@@ -82,19 +126,21 @@ def receiver_process(out_dir_path, result_queue, log_queue, conn):
                          .format(out_rel_path))
             results.append(out_rel_path)
         conn.send(results)
-        logger.debug('Finished running receiver_process (pid: {})'
-                     .format(os.getpid()))
+        logger.debug('Receiver exitting (pid: {})'.format(os.getpid()))
     except KeyboardInterrupt:
         pass
 
 
 def host(num_processes, in_dir_path, out_dir_path,
-         log_queue, worker_sleep_sec,
+         log_queue, worker_sleep_sec, receiver_is_process,
          *, logger=None):
     logger = logger or _null_logger
-    logger.debug('num_processes: {}'.format(num_processes))
-    logger.debug('in_dir_path: "{}"'.format(in_dir_path))
-    logger.debug('out_dir_path: {})'.format(out_dir_path))
+    logger.info('num_processes: {}'.format(num_processes))
+    logger.info('in_dir_path: "{}"'.format(in_dir_path))
+    logger.info('out_dir_path: "{}"'.format(out_dir_path))
+    logger.info('worker_sleep_sec: {}'.format(worker_sleep_sec))
+    logger.info('receiver_is_process: {}'.format(receiver_is_process))
+
     if not os.path.exists(in_dir_path):
         logger.error('"{}" does not exist'.format(in_dir_path))
         return
@@ -112,22 +158,35 @@ def host(num_processes, in_dir_path, out_dir_path,
     request_queue = Queue()
     result_queue = Queue()
 
-    # Workerプロセスの前にReceiverプロセスを起動しないと
-    # result_queueが詰まる
+    # Workerプロセスの前にReceiverを起動しないとresult_queueが詰まる
     parent_conn, child_conn = Pipe()
-    receiver_args = (out_dir_path, result_queue, log_queue, child_conn)
-    receiver = Process(target=receiver_process,
-                       args=receiver_args)
+    receiver_args = (out_dir_path, result_queue, child_conn)
+    receiver_kwargs = {'is_process': receiver_is_process,
+                       'log_queue': log_queue,
+                       'logger': logger}
+    if receiver_is_process:
+        logger.debug('Using Process for receiver')
+        receiver = Process(target=receiver_task,
+                           args=receiver_args,
+                           kwargs=receiver_kwargs)
+    else:
+        logger.debug('Using Thread for receiver')
+        receiver = Thread(target=receiver_task,
+                          args=receiver_args,
+                          kwargs=receiver_kwargs)
     receiver.start()
 
     for i in range(num_processes):
-        args = (request_queue, result_queue, log_queue,
-                out_dir_path, worker_sleep_sec)
-        p = Process(target=worker_process, args=args)
+        args = (request_queue, result_queue, out_dir_path, worker_sleep_sec)
+        kwargs = {'is_process': True,
+                  'log_queue': log_queue,
+                  'logger': logger}
+        p = Process(target=worker_task, args=args, kwargs=kwargs)
         workers.append(p)
+        logger.debug('Starting a new worker {}'.format(p.name))
         p.start()
 
-    # output_queueにputされるはずのファイル数
+    # result_queueにputされるはずのファイル数
     num_files = 0
     for (dirpath, dirnames, filenames) in os.walk(in_dir_path):
         # ディレクトリはhost側で作成してしまう
@@ -152,7 +211,7 @@ def host(num_processes, in_dir_path, out_dir_path,
 
     # sentinelを送信してWorkerに終了するよう指示する
     for p in workers:
-        request_queue.put('STOP')
+        request_queue.put(None)
 
     # Workerプロセスの終了を待つ
     for p in workers:
@@ -165,17 +224,14 @@ def host(num_processes, in_dir_path, out_dir_path,
     result_queue.put(None)
     results = parent_conn.recv()
     receiver.join()
-
-    if len(results) != num_files:
+    if len(results) == num_files:
+        logger.info('Total num of files processed: {}'.format(num_files))
+    else:
         logger.error('Received results size seems wrong: {} != {}'
                      .format(len(results), num_files))
-
-    successful = check(in_dir_path, out_dir_path, results,
-                       logger=logger)
-    if successful:
+    if check(in_dir_path, out_dir_path, results, logger=logger):
         logger.debug('in_dir_path and out_dir_path seem to have'
-                     ' same structure. Looks good.')
-    return successful
+                     ' exactly same structure. Looks perfect.')
 
 
 def check(in_dir_path, out_dir_path, results,
@@ -218,16 +274,6 @@ def check(in_dir_path, out_dir_path, results,
     return True
 
 
-def logger_thread(log_queue):
-    '''\
-    複数プロセスから送られてくるLogRecordを集約するThreadの本体
-    log_queueから'STOP'を受け取ると終了する
-    '''
-    for record in iter(log_queue.get, 'STOP'):
-        logger = getLogger(__name__)
-        logger.handle(record)
-
-
 def main():
     parser = ArgumentParser(description=(__doc__),
                             formatter_class=RawDescriptionHelpFormatter)
@@ -239,19 +285,27 @@ def main():
                         default='INFO',
                         help=('Set log level. e.g. DEBUG, INFO, WARN'))
     parser.add_argument('-d', '--debug', action='store_true',
-                        help=('Path to watch'))
+                        help='Same as --log DEBUG')
+    parser.add_argument('-w', '--warn', action='store_true',
+                        help='Same as --log WARN')
     parser.add_argument('-n', '--num-processes', type=int,
                         default=5,
                         help='Number of worker processes')
     parser.add_argument('-s', '--worker-sleep-sec', type=float,
                         default=None,
                         help='Sleep time (in sec) of each work')
+    parser.add_argument('--receiver-is-process', action='store_true',
+                        help='Use process instead of thread for receiver')
     args = parser.parse_args()
     logger = getLogger(__name__)
+    logger.propagate = False  # ルートロガーにログを伝播させない
     handler = StreamHandler()
     if args.debug:
         handler.setLevel(DEBUG)
         logger.setLevel(DEBUG)
+    elif args.warn:
+        handler.setLevel(WARN)
+        logger.setLevel(WARN)
     else:
         handler.setLevel(args.log.upper())
         logger.setLevel(args.log.upper())
@@ -259,20 +313,24 @@ def main():
     # e.g. '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     handler.setFormatter(Formatter('%(asctime)s - %(process)d - %(message)s'))
     try:
+        num_processes = args.num_processes
+        in_dir_path = os.path.abspath(args.in_dir_path)
+        out_dir_path = os.path.abspath(args.out_dir_path)
+        worker_sleep_sec = args.worker_sleep_sec
+        receiver_is_process = args.receiver_is_process
         logger.info('Start running')
+        started = time.time()
         log_queue = Queue()
-        log_thread = Thread(target=logger_thread, args=(log_queue,))
+        log_thread = Thread(target=logger_task, args=(log_queue,))
         log_thread.start()
-        host(args.num_processes,
-             os.path.abspath(args.in_dir_path),
-             os.path.abspath(args.out_dir_path),
-             log_queue,
-             args.worker_sleep_sec,
-             logger=logger)
+        host(num_processes, in_dir_path, out_dir_path, log_queue,
+             worker_sleep_sec, receiver_is_process, logger=logger)
         # sentinelを送りlog_threadを終了させる
-        log_queue.put('STOP')
+        log_queue.put(None)
         log_thread.join()
-        logger.info('Finished running')
+        ended = time.time()
+        logger.info('Finished running (Elapsed {})'
+                    .format(_human_readable_time(ended - started)))
     except KeyboardInterrupt:
         logger.info('Keyboard Interrupt occured. Exitting')
 
